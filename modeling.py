@@ -66,7 +66,7 @@ class CausalSelfAttention(nn.Module):
 
         self.register_buffer("rope_cache", rope_cache, persistent=False)
 
-    def forward(self, x):
+    def forward(self, x, *, attn_mask=None):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.shape
 
@@ -82,16 +82,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rope(q, self.rope_cache)
         k = apply_rope(k, self.rope_cache)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # efficient attention using Flash Attention CUDA kernels
-        # By specifying is_causal, we don't have to pass a mask.
-        # But we might want a causal mask if we have padding tokens in the inputs.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if attn_mask is not None:
+            # Insert a new batch dimension for the multiple attn heads
+            attn_mask = attn_mask.view(B, 1, T, T)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
         y = self.wo(y)
         return y
 
@@ -120,20 +120,26 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(config.n_embd)
         self.feed_forward = FeedForward(config)
 
-    def forward(self, x):
-        x = x + self.attention(self.attention_norm(x))
+    def forward(self, x, *, attn_mask=None):
+        x = x + self.attention(self.attention_norm(x), attn_mask=attn_mask)
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
 
 
 @dataclasses.dataclass
 class Config:
+    # model
     max_seq_len: int = 4096
-    # TODO: pad this to a nearest multiple of 256 for efficiency
-    vocab_size: int = 32000
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
+
+    # tokenizer
+    bos_id: int = 1
+    eos_id: int = 2
+    pad_id: int = 2  # by default use eos_id for pad_id
+    # TODO: pad this to a nearest multiple of 256 for efficiency
+    vocab_size: int = 32000
 
     @classmethod
     def from_name(cls, name: str):
@@ -185,13 +191,13 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        b, t = idx.size()
+    def forward(self, idx, *, targets=None, attn_mask=None):
+        b, t = idx.shape
 
         # token embeddings of shape (b, t, n_embd)
         x = self.tok_embeddings(idx)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, attn_mask=attn_mask)
         x = self.norm(x)
 
         if targets is not None:
@@ -208,222 +214,164 @@ class Llama(nn.Module):
 
         return logits, loss
 
-    @classmethod
-    def from_name(cls, name):
-        return cls(Config.from_name(name))
-
-    @classmethod
     @torch.no_grad()
-    def from_pretrained(cls, name, model_ckpt):
-        print(f"(1/3) Loading pretrained weights {name}.")
-
-        # n_layer, n_head and n_embd are determined from name
-        # create a from-scratch initialized transformer
-        config = Config.from_name(name)
-        model = cls(config)
-        print(f"(2/3) Initialized {name} on CPU.")
-
-        checkpoint = torch.load(model_ckpt, map_location="cpu")
-        print(f"(3/3) Loaded pretrained {name} onto CPU.")
-
-        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
-
-        # Put the wq, wk and wv matrices into a single matrix called wqkv
-        # Ignore those keys in unexpected (used)
-        used = set()
-        found = set()
-        for i, layer in enumerate(model.layers):
-            key = f"layers.{i}.attention.wq.weight"
-            layer.attention.wqkv.weight[: config.n_embd, :] = checkpoint[key]
-            used.add(key)
-
-            key = f"layers.{i}.attention.wk.weight"
-            layer.attention.wqkv.weight[
-                config.n_embd : config.n_embd * 2, :
-            ] = checkpoint[key]
-            used.add(key)
-
-            key = f"layers.{i}.attention.wv.weight"
-            layer.attention.wqkv.weight[
-                config.n_embd * 2 : config.n_embd * 3, :
-            ] = checkpoint[key]
-            used.add(key)
-
-            found.add(f"layers.{i}.attention.wqkv.weight")
-
-        missing = [k for k in missing if k not in found]
-        if missing:
-            print(f"Missing keys: {missing}")
-        unexpected = [k for k in missing if k not in used]
-        if unexpected:
-            print(f"Unexpected keys: {unexpected}")
-
-        return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and rmsnorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
-
-        # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear,)
-        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith("bias"):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
-
-        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
-        # will appear in the no_decay and decay sets respectively after the above.
-        # In addition, because named_parameters() doesn't return duplicates, it
-        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
-        # so let's manually remove 'lm_head.weight' from decay set. This will include
-        # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove("lm_head.weight")
-
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert (
-            len(inter_params) == 0
-        ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-        assert (
-            len(param_dict.keys() - union_params) == 0
-        ), "parameters %s were not separated into either decay/no_decay set!" % (
-            str(param_dict.keys() - union_params),
-        )
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
-                "weight_decay": 0.0,
-            },
-        ]
-        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = device_type == "cuda"
-        print(f"using fused AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, **extra_args
-        )
-
-        return optimizer
-
-    # ---------------------------------------------------------
-    # This stuff hasn't been updated with rotary embeddings yet
-    # ---------------------------------------------------------
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.max_seq_len
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, toks, max_new_tokens, *, temp=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t))
         and complete the sequence max_new_tokens times, feeding the predictions
         back into the model each time. Most likely you'll want to make sure to
         be in model.eval() mode of operation for this.
         """
+        attn_mask = None
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at max_seq_len
-            idx_cond = (
-                idx
-                if idx.size(1) <= self.config.max_seq_len
-                else idx[:, -self.config.max_seq_len :]
-            )
+            # if the context is growing too long we must crop it at max_seq_len
+            tok_cxt = toks[:, -self.config.max_seq_len :]
+            # TODO: switch 2 to the padding token
+            attn_mask = pad_attn_mask(tok_cxt, self.config.pad_id, prev_mask=attn_mask)
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(tok_cxt, attn_mask=attn_mask)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :] / temp
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
+                logits[logits < v[:, [-1]]] = -torch.inf
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+            # append sampled tokens to the running sequence and continue
+            toks = torch.cat((toks, next_tok), dim=1)
 
-        return idx
+        return toks
 
 
 class Tokenizer:
-    def __init__(self, model_path: str):
-        # reload tokenizer
-        assert os.path.isfile(model_path), model_path
-        self.sp_model = sentencepiece.SentencePieceProcessor(model_file=model_path)
-
-        # BOS / EOS token IDs
-        self.n_words = self.sp_model.vocab_size()
-        self.bos_id = self.sp_model.bos_id()
-        self.eos_id = self.sp_model.eos_id()
-        self.pad_id = self.sp_model.pad_id()
+    def __init__(self, config, sp_model):
+        self.config = config
+        self.sp_model = sp_model
         assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
 
-    def encode(self, s: str, *, bos: bool, eos: bool) -> list[int]:
-        assert type(s) is str
-        t = self.sp_model.encode(s)
+    def encode(self, msg: str, *, bos: bool, eos: bool) -> list[int]:
+        assert type(msg) is str
+        t = self.sp_model.encode(msg)
         if bos:
-            t = [self.bos_id] + t
+            t = [self.config.bos_id] + t
         if eos:
-            t = t + [self.eos_id]
+            t = t + [self.config.eos_id]
         return t
 
-    def encode_batch(self, msgs: list[str], *, bos: bool, eos: bool) -> list[list[int]]:
+    def encode_batch(self, msgs: list[str], *, bos: bool, eos: bool) -> torch.Tensor:
         if eos:
-            raise NotImplementedError(
-                "Haven't implemented batch encoding with an EOS token"
-            )
+            raise NotImplementedError("batch encoding with EOS token")
 
         batch = [self.encode(s, bos=bos, eos=eos) for s in msgs]
-
+        B = len(batch)
         max_len = max(len(t) for t in batch)
 
-        return [self._pad(t, max_len) for t in batch]
+        padded = torch.full((B, max_len), self.config.pad_id)
+        for b, tokens in enumerate(batch):
+            padded[b, -len(tokens) :] = torch.tensor(tokens)
 
-    def _pad(self, t: list[int], length: int) -> list[int]:
-        missing = length - len(t)
-        if missing < 0:
-            raise RuntimeError("Can't apply negative padding")
-
-        return t + [self.pad_id] * missing
+        return padded
 
     def decode(self, t: list[int]) -> str:
         return self.sp_model.decode(t)
+
+    def decode_batch(self, toks: torch.Tensor):
+        # Need to ignore any tokens after eos_id
+        raise NotImplementedError()
+
+
+def pad_attn_mask(tokens, pad_id, *, prev_mask=None):
+    inf = 1e9  # Use 1e9 as infinity to avoid nan
+
+    B, T = tokens.shape
+
+    if prev_mask is not None:
+        mask = prev_mask
+        # Add column on the right
+        mask = F.pad(mask, (0, 1, 0, 0), "constant", -inf)
+        # Add row on the bottom
+        mask = F.pad(mask, (0, 0, 0, 1), "constant", 0.0)
+    else:
+        # 1. 0s in the upper diagonal, 1s in the lower
+        # 2. Set all 0s to -infinity
+        # 3. Set all 1s to 0
+        # 4. End with -infinity in the upper diagonal, 0s in the lower
+        mask = torch.ones((B, T, T), device=tokens.device).tril()
+        mask = mask.masked_fill(mask == 0, -inf)
+        mask = mask.masked_fill(mask == 1, 0)
+
+    assert mask.shape == (B, T, T), "mask is wrong shape!"
+
+    pad_tokens = (tokens == pad_id).unsqueeze(1)  # (B, 1, T)
+    return mask.masked_fill(pad_tokens, -inf)
+
+
+@torch.no_grad()
+def load_pretrained_llama(name, model_ckpt):
+    print(f"(1/4) Loading pretrained weights {name}.")
+
+    # n_layer, n_head and n_embd are determined from name
+    # create a from-scratch initialized transformer
+    config = Config.from_name(name)
+    model = Llama(config)
+    print(f"(2/4) Initialized {name} on CPU.")
+
+    checkpoint = torch.load(model_ckpt, map_location="cpu")
+    print(f"(3/4) Loaded pretrained {name} onto CPU.")
+
+    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+
+    # Put the wq, wk and wv matrices into a single matrix called wqkv
+    # Ignore those keys in unexpected (used)
+    used = set()
+    found = set()
+    for i, layer in enumerate(model.layers):
+        key = f"layers.{i}.attention.wq.weight"
+        layer.attention.wqkv.weight[: config.n_embd, :] = checkpoint[key]
+        used.add(key)
+
+        key = f"layers.{i}.attention.wk.weight"
+        layer.attention.wqkv.weight[config.n_embd : config.n_embd * 2, :] = checkpoint[
+            key
+        ]
+        used.add(key)
+
+        key = f"layers.{i}.attention.wv.weight"
+        layer.attention.wqkv.weight[
+            config.n_embd * 2 : config.n_embd * 3, :
+        ] = checkpoint[key]
+        used.add(key)
+
+        found.add(f"layers.{i}.attention.wqkv.weight")
+
+    print("(4/4) Loaded state dict.")
+
+    missing = [k for k in missing if k not in found]
+    if missing:
+        print(f"Missing keys: {missing}")
+    unexpected = [k for k in missing if k not in used]
+    if unexpected:
+        print(f"Unexpected keys: {unexpected}")
+
+    return model
+
+
+def load_pretrained_tokenizer(name, tok_ckpt):
+    config = Config.from_name(name)
+
+    # reload tokenizer
+    assert os.path.isfile(tok_ckpt), tok_ckpt
+    sp_model = sentencepiece.SentencePieceProcessor(model_file=tok_ckpt)
+    assert config.vocab_size == sp_model.vocab_size()
+
+    # BOS / EOS token IDs
+    assert config.bos_id == sp_model.bos_id()
+    assert config.eos_id == sp_model.eos_id()
+    # Don't check pad token because it doesn't matter
+
+    tokenizer = Tokenizer(config, sp_model)
+
+    return tokenizer
