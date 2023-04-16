@@ -128,8 +128,9 @@ class Block(nn.Module):
 
 @dataclasses.dataclass
 class Config:
+    name: str = "llama-7b"
     # model
-    max_seq_len: int = 4096
+    max_seq_len: int = 8192  # can be quite large; only affects rope cache
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
@@ -148,9 +149,9 @@ class Config:
 
 llama_configs = {
     "llama-7b": Config(n_layer=32, n_head=32, n_embd=4096),
-    "llama-13b": Config(n_layer=40, n_head=40, n_embd=5120),
-    "llama-30b": Config(n_layer=60, n_head=52, n_embd=6656),
-    "llama-65b": Config(n_layer=80, n_head=64, n_embd=8192),
+    "llama-13b": Config(name="llama-13b", n_layer=40, n_head=40, n_embd=5120),
+    "llama-30b": Config(name="llama-30b", n_layer=60, n_head=52, n_embd=6656),
+    "llama-65b": Config(name="llama-65b", n_layer=80, n_head=64, n_embd=8192),
 }
 
 
@@ -191,11 +192,11 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, *, targets=None, attn_mask=None):
-        b, t = idx.shape
+    def forward(self, toks, *, targets=None, loss_mask=None, attn_mask=None):
+        b, t = toks.shape
 
         # token embeddings of shape (b, t, n_embd)
-        x = self.tok_embeddings(idx)
+        x = self.tok_embeddings(toks)
         for layer in self.layers:
             x = layer(x, attn_mask=attn_mask)
         x = self.norm(x)
@@ -203,6 +204,11 @@ class Llama(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(x)
+            
+            if loss_mask is not None:
+                logits = logits[loss_mask == 1]
+                targets = targets[loss_mask == 1]
+
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
@@ -217,7 +223,7 @@ class Llama(nn.Module):
     @torch.no_grad()
     def generate(self, toks, max_new_tokens, *, temp=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t))
+        Take a conditioning sequence of tokens (LongTensor of shape (b,t))
         and complete the sequence max_new_tokens times, feeding the predictions
         back into the model each time. Most likely you'll want to make sure to
         be in model.eval() mode of operation for this.
@@ -225,11 +231,11 @@ class Llama(nn.Module):
         attn_mask = None
         for _ in range(max_new_tokens):
             # if the context is growing too long we must crop it at max_seq_len
-            tok_cxt = toks[:, -self.config.max_seq_len :]
+            tok_ctx = toks[:, -self.config.max_seq_len :]
             # TODO: switch 2 to the padding token
-            attn_mask = pad_attn_mask(tok_cxt, self.config.pad_id, prev_mask=attn_mask)
+            attn_mask = pad_for_gen(tok_ctx, self.config.pad_id, prev_mask=attn_mask)
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(tok_cxt, attn_mask=attn_mask)
+            logits, _ = self(tok_ctx, attn_mask=attn_mask)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temp
             # optionally crop the logits to only the top k options
@@ -246,44 +252,7 @@ class Llama(nn.Module):
         return toks
 
 
-class Tokenizer:
-    def __init__(self, config, sp_model):
-        self.config = config
-        self.sp_model = sp_model
-        assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
-
-    def encode(self, msg: str, *, bos: bool, eos: bool) -> list[int]:
-        assert type(msg) is str
-        t = self.sp_model.encode(msg)
-        if bos:
-            t = [self.config.bos_id] + t
-        if eos:
-            t = t + [self.config.eos_id]
-        return t
-
-    def encode_batch(self, msgs: list[str], *, bos: bool, eos: bool) -> torch.Tensor:
-        if eos:
-            raise NotImplementedError("batch encoding with EOS token")
-
-        batch = [self.encode(s, bos=bos, eos=eos) for s in msgs]
-        B = len(batch)
-        max_len = max(len(t) for t in batch)
-
-        padded = torch.full((B, max_len), self.config.pad_id)
-        for b, tokens in enumerate(batch):
-            padded[b, -len(tokens) :] = torch.tensor(tokens)
-
-        return padded
-
-    def decode(self, t: list[int]) -> str:
-        return self.sp_model.decode(t)
-
-    def decode_batch(self, toks: torch.Tensor):
-        # Need to ignore any tokens after eos_id
-        raise NotImplementedError()
-
-
-def pad_attn_mask(tokens, pad_id, *, prev_mask=None):
+def pad_for_gen(tokens, pad_id, *, prev_mask=None):
     inf = 1e9  # Use 1e9 as infinity to avoid nan
 
     B, T = tokens.shape
@@ -309,18 +278,59 @@ def pad_attn_mask(tokens, pad_id, *, prev_mask=None):
     return mask.masked_fill(pad_tokens, -inf)
 
 
+class Tokenizer:
+    def __init__(self, config, sp_model):
+        self.config = config
+        self.sp_model = sp_model
+        assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
+
+    def encode(self, msg: str, *, bos: bool, eos: bool, out: str = "py") -> list[int]:
+        assert type(msg) is str
+        t = self.sp_model.encode(msg)
+        if bos:
+            t = [self.config.bos_id] + t
+        if eos:
+            t = t + [self.config.eos_id]
+        if out == "py":
+            return t
+        elif out == "pt":
+            return torch.tensor(t, dtype=torch.int64)
+        else:
+            raise ValueError(out)
+
+    def encode_batch(self, msgs: list[str], *, bos: bool, eos: bool) -> torch.Tensor:
+        if eos:
+            raise NotImplementedError("batch encoding with EOS token")
+
+        batch = [self.encode(s, bos=bos, eos=eos) for s in msgs]
+        B = len(batch)
+        max_len = max(len(t) for t in batch)
+
+        padded = torch.full((B, max_len), self.config.pad_id)
+        for b, tokens in enumerate(batch):
+            padded[b, -len(tokens) :] = torch.tensor(tokens)
+
+        return padded
+
+    def decode(self, t: list[int]) -> str:
+        return self.sp_model.decode(t)
+
+    def decode_batch(self, toks: torch.Tensor):
+        # Need to ignore any tokens after eos_id
+        raise NotImplementedError()
+
+
 @torch.no_grad()
-def load_pretrained_llama(name, model_ckpt):
-    print(f"(1/4) Loading pretrained weights {name}.")
+def load_pretrained_llama(config, model_ckpt):
+    print(f"(1/4) Loading pretrained weights {config.name}.")
 
     # n_layer, n_head and n_embd are determined from name
     # create a from-scratch initialized transformer
-    config = Config.from_name(name)
     model = Llama(config)
-    print(f"(2/4) Initialized {name} on CPU.")
+    print(f"(2/4) Initialized {config.name} on CPU.")
 
     checkpoint = torch.load(model_ckpt, map_location="cpu")
-    print(f"(3/4) Loaded pretrained {name} onto CPU.")
+    print(f"(3/4) Loaded pretrained {config.name} onto CPU.")
 
     missing, unexpected = model.load_state_dict(checkpoint, strict=False)
 
@@ -359,9 +369,7 @@ def load_pretrained_llama(name, model_ckpt):
     return model
 
 
-def load_pretrained_tokenizer(name, tok_ckpt):
-    config = Config.from_name(name)
-
+def load_pretrained_tokenizer(config, tok_ckpt):
     # reload tokenizer
     assert os.path.isfile(tok_ckpt), tok_ckpt
     sp_model = sentencepiece.SentencePieceProcessor(model_file=tok_ckpt)
