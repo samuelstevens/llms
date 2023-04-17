@@ -4,6 +4,12 @@ We want to use decoder-only language models to do seq2seq problems rather than j
 To tune these large models, we use FullyShardedDataParallel (FSDP) from PyTorch to split the model over multiple GPUs efficiently.
 
 For simplicity, we use sequences padded at the end. In the future, we could use NestedTensors which apparently work, but since I am just starting with FullyShardedDataParallel, I want to leave that for future work.
+
+TODO: we are running out of memory, likely because the longest sequences are *really* long. We probably need to filter examples that are longer than X tokens. However, this will necessarily limit the dialogue capabilities of the tuned model because it will have a limited context length.
+
+Other strategies:
+    * gradient checkpointing
+    * JIT on a per module basis (not the entire model) to get a speedup to counteract the slower gradient checkpointing
 """
 
 import heapq
@@ -12,10 +18,11 @@ import logging
 import os
 
 import torch
-from tqdm.auto import tqdm
+import torch.distributed.fsdp
 from torch.utils.data import DataLoader
 
 import modeling
+import optim
 import wandb
 
 model_name = "llama-7b"
@@ -24,20 +31,13 @@ model_ckpt = "/research/nfs_su_809/workspace/shared/llama/raw/7B/consolidated.00
 data_path = "data/databricks-dolly-15k.jsonl"  # about 3.7M tokens, 7.5 MB
 
 # Training
-global_batch_size = 4
-gradient_accumulation_steps = 2
+global_batch_size = 128
+gradient_accumulation_steps = 32
 learning_rate = 3e-4
 weight_decay = 0.01
 grad_clip = 2.0
 epochs = 300
 warmup_steps = 1000
-
-dtype = "float16"
-# PyTorch dtype
-ptdtype = getattr(torch, dtype)
-ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
-# Don't need scaler for bfloat16 because it's higher range, lower precision.
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 save_root = "/local/scratch/stevens.994/llm/checkpoints"
 log_every = 10
@@ -52,19 +52,15 @@ torch.backends.cudnn.allow_tf32 = True
 # Distributed setup
 # -----------------
 
-is_ddp = int(os.environ.get("LOCAL_RANK", -1)) != -1
-if is_ddp:
-    torch.distributed.init_process_group(backend="nccl")
-    rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    is_master = rank == 0
-    seed_offset = rank
-    torch.distributed.barrier()
-else:
-    rank = 0
-    world_size = 1
-    is_master = True
-    seed_offset = 0
+if "LOCAL_RANK" not in os.environ:
+    raise RuntimeError("need to run in distributed environment")
+
+torch.distributed.init_process_group(backend="nccl")
+rank = int(os.environ["LOCAL_RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+is_master = rank == 0
+seed_offset = rank
+torch.distributed.barrier()
 
 device = f"cuda:{rank}"
 torch.cuda.set_device(device)
@@ -119,39 +115,37 @@ def build_dataset():
     return dataset
 
 
+def padded_collate_fn(batch) -> dict[str, object]:
+    B = len(batch)
+    L = max(len(x) for (x, y, m) in batch)
+    xs = torch.full((B, L), model_cfg.pad_id, dtype=torch.int64)
+    ys = torch.full((B, L), model_cfg.pad_id, dtype=torch.int64)
+    mask = torch.zeros_like(ys)
+    for i, (x, y, m) in enumerate(batch):
+        xs[i][: len(x)] = x
+        ys[i][: len(y)] = y
+        mask[i][: len(m)] = m
+
+    return dict(toks=xs, targets=ys, loss_mask=mask)
+
+
 def build_dataloader():
-    def padded_collate_fn(batch) -> dict[str, object]:
-        B = len(batch)
-        L = max(len(x) for (x, y, m) in batch)
-        xs = torch.full((B, L), model_cfg.pad_id, dtype=torch.int64)
-        ys = torch.full((B, L), model_cfg.pad_id, dtype=torch.int64)
-        mask = torch.zeros_like(ys)
-        for i, (x, y, m) in enumerate(batch):
-            xs[i][: len(x)] = x
-            ys[i][: len(y)] = y
-            mask[i][: len(m)] = m
-
-        return dict(toks=xs, targets=ys, loss_mask=mask)
-
     dataset = build_dataset()
 
-    if is_ddp:
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            drop_last=False,
-            shuffle=True,
-            num_replicas=world_size,
-            rank=rank,
-        )
-    else:
-        sampler = torch.utils.data.RandomSampler(dataset)
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset,
+        drop_last=False,
+        shuffle=True,
+        num_replicas=world_size,
+        rank=rank,
+    )
 
     return DataLoader(
         dataset=dataset,
         batch_size=local_batch_size,
         sampler=sampler,
         drop_last=False,
-        num_workers=8,
+        num_workers=4,
         # TODO: Evaluate whether this helps throughput on A100 and on A6000.
         pin_memory=True,
         persistent_workers=True,
@@ -172,16 +166,16 @@ def get_lr():
     return learning_rate
 
 
-def move(obj: object, device) -> object:
+def move(obj: object, device, blocking=False) -> object:
     if hasattr(obj, "to"):
-        return obj.to(device)
+        return obj.to(device, non_blocking=not blocking)
 
     if isinstance(obj, dict):
         for key, value in obj.items():
-            obj[move(key, device)] = move(value, device)
+            obj[key] = move(value, device, blocking=blocking)
         return obj
     elif isinstance(obj, list):
-        return [move(elem, device) for elem in obj]
+        return [move(elem, device, blocking=blocking) for elem in obj]
     elif isinstance(obj, str):
         return obj
     else:
@@ -193,34 +187,25 @@ def train():
     global step
     model.train()
 
-    for i, batch in enumerate(tqdm(dataloader)):
-        # Whether we will actually do an optimization step
-        will_step = i % gradient_accumulation_steps == 0
-        # Only need to sync if we're doing an optimization step
-        model.require_backward_grad_sync = will_step
-
-        batch = move(batch, device)
-
-        with ctx:
-            logits, loss = model(**batch)
-
+    for i, batch in enumerate(dataloader):
+        batch = move(batch, device, blocking=False)
+        _, loss = model(**batch)
         loss = loss / gradient_accumulation_steps
-        scaler.scale(loss).backward()
+        loss.backward()
 
         # Update the learning rate while we wait for the forward pass
         lr = get_lr()
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        
+
         grad = None
-        if will_step:
+        if i % gradient_accumulation_steps == 0:
             # Clip gradients (TODO: update for FSDP: https://pytorch.org/docs/stable/fsdp.html#torch.distributed.fsdp.FullyShardedDataParallel.clip_grad_norm_)
             # if grad_clip > 0:
-                # scaler.unscale_(optimizer)
-                # grad = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # scaler.unscale_(optimizer)
+            # grad = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             # Step optimizer
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             # This has to be after optimizer.step() or scaler.step(optimizer)
             optimizer.zero_grad(set_to_none=True)
             step += 1
@@ -237,6 +222,7 @@ def train():
                 "perf/batches": i,
                 "train/grad": grad,
             }
+            logger.info("METRICS: %s", json.dumps(metrics))
             wandb.log(metrics)
 
     logger.info(f"Finished epoch {epoch} training.")
@@ -322,35 +308,38 @@ def restore():
     step = latest_ckpt["step"]
 
 
+def wrap_policy(*args, **kwargs):
+    return torch.distributed.fsdp.wrap.transformer_auto_wrap_policy(
+        *args, **kwargs, transformer_layer_cls={modeling.Block}
+    )
+
+
 if __name__ == "__main__":
     # First epoch
     start = 0
-    
-    model_cfg = modeling.Config(n_layer=4, n_head=8, n_embd=1024)
-    # model_cfg = modeling.Config.from_name(model_name)
-    # model = modeling.load_pretrained_llama(model_cfg, model_ckpt)
-    model = modeling.Llama(model_cfg)
+
+    model_cfg = modeling.Config.from_name(model_name)
+    model = modeling.load_pretrained_llama(model_cfg, model_ckpt)
     tokenizer = modeling.load_pretrained_tokenizer(model_cfg, tokenizer_ckpt)
     model_without_ddp = model
-    model.to(device)
     # TODO: try compiling
 
-    if is_ddp:
-        # TODO: needs to be FSDP
-        # model = torch.distributed.fsdp.FullyShardedDataParallel(
-            # model
-        # )
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[rank],
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-        )
+    bf16 = torch.distributed.fsdp.MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+    model = torch.distributed.fsdp.FullyShardedDataParallel(
+        model,
+        auto_wrap_policy=wrap_policy,
+        mixed_precision=bf16,
+        device_id=torch.cuda.current_device(),
+    )
 
     dataloader = build_dataloader()
     # The optimizer must be initialized after the module has been wrapped, since FSDP will shard parameters in-place and this will break any previously initialized optimizers.
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
+    optimizer = optim.Lion(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=False
     )
 
     resumed_and_id = [False, None]
@@ -368,7 +357,6 @@ if __name__ == "__main__":
                 warmup_steps=warmup_steps,
                 weight_decay=weight_decay,
                 learning_rate=learning_rate,
-                amp=dtype,
                 grad_clip=grad_clip,
                 debug=False,
             ),
@@ -380,8 +368,7 @@ if __name__ == "__main__":
     # Now non-master processes have resumed and run_id
     # Refer to https://github.com/pytorch/pytorch/issues/56142
     # for why we need a variable instead of an anonymous list
-    if is_ddp:
-        torch.distributed.broadcast_object_list(resumed_and_id)
+    torch.distributed.broadcast_object_list(resumed_and_id)
     resumed, run_id = resumed_and_id
 
     if resumed:

@@ -130,7 +130,7 @@ class Block(nn.Module):
 class Config:
     name: str = "llama-7b"
     # model
-    max_seq_len: int = 8192  # can be quite large; only affects rope cache
+    max_seq_len: int = 2**14  # can be quite large; only affects rope cache
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
@@ -204,7 +204,7 @@ class Llama(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(x)
-            
+
             if loss_mask is not None:
                 logits = logits[loss_mask == 1]
                 targets = targets[loss_mask == 1]

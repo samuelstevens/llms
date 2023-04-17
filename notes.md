@@ -8,3 +8,8 @@ Next steps:
 
 1. NestedTensors for faster batched inference
 2. Fully Sharded Data Parallel
+
+Eventual goals:
+
+1. Instruction-tuning Llama
+2. Toolformer + Llama
